@@ -1,0 +1,265 @@
+#  A github workflow to build custom android common kernels with specified parameters
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+name: Build Kernel
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      ack_branch:
+        description: 'Android-common-kernel branch'
+        required: true
+        default: 'common-android13-5.15'
+        type: string
+      custom_kernel_repo:
+        description: 'Kernel source repo'
+        required: true
+        default: 'https://github.com/abhiram79/xiaomi_kernel_topaz'
+        type: string
+      custom_kernel_repo_branch:
+        description: 'Kernel repo source branch'
+        required: true
+        default: 'android13-5.15-lts'
+        type: string
+      use_latest_clang:
+        description: 'Use the latest clang prebuilts'
+        required: true
+        default: true
+        type: boolean
+      anykernel_url_plus_branch:
+        description: 'Space-separated AnyKernel3 fork URL + (Optional) Branch'
+        required: true
+        default: 'https://github.com/abhiram79/AnyKernel3'
+        type: string
+      kernel_image_type:
+        description: 'Kernel image to package (Image.gz, Image.lz4, etc)'
+        required: true
+        default: 'Image'
+      fast_build:
+        description: 'Instruct tools to perform a Fast Build'
+        required: true
+        default: true
+        type: boolean
+      use_kleaf:
+        description: 'Use the kleaf build system instead of build script'
+        required: true
+        default: false
+        type: boolean
+      extra_args:
+        description: 'Extra arguments that will be passed to build system/script'
+        required: false
+      build_configs:
+        description: 'Space-separated list of build configurations'
+        required: true
+        default: 'build.config.gki.aarch64.velvet'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BUILD_CONFIGS: ${{ github.event.inputs.build_configs }}
+      IMAGE_TYPE: ${{ github.event.inputs.kernel_image_type }}
+
+      ACK_BRANCH: ${{ github.event.inputs.ack_branch }}
+      COMMON_REPO: ${{ github.event.inputs.custom_kernel_repo }}
+      COMMON_REPO_BRANCH: ${{ github.event.inputs.custom_kernel_repo_branch }}
+      AK3_GIT_URL_PLUS_BRANCH: ${{ github.event.inputs.anykernel_url_plus_branch }}
+
+      AK3_DIR: ${{ github.workspace }}/kernel-build/anykernel3
+      FINAL_DIR: ${{ github.workspace }}/kernel-build/final_images
+
+    steps:
+      - name: Validate inputs
+        run: |
+          AK3_GIT_URL=$(echo "${AK3_GIT_URL_PLUS_BRANCH}" | awk '{print $1}')
+          AK3_GIT_BRANCH=$(echo "${AK3_GIT_URL_PLUS_BRANCH}" | awk '{print $2}')
+          
+          # Export these variables while we're at it
+          echo "AK3_GIT_URL=${AK3_GIT_URL}" >> ${GITHUB_ENV}
+          echo "AK3_GIT_BRANCH=${AK3_GIT_BRANCH}" >> ${GITHUB_ENV}
+
+          validate_url() {
+            if [[ ! "$1" =~ ^https://.+/.+/.+$ ]]; 
+              then
+                echo "Invalid URL: $1"
+                echo "URL must be a valid HTTPS git repository URL"
+                exit 1
+            fi
+          }
+
+          validate_url ${COMMON_REPO}
+          validate_url ${AK3_GIT_URL}
+
+          validate_single_word() {
+            if [[ "$1" =~ [[:space:]] ]]; 
+              then
+                echo "::error::Invalid $2: $1"
+                echo "$2 must be a single word without spaces"
+                exit 1
+            fi
+          }
+
+          validate_single_word "${ACK_BRANCH}" \
+          "Android-common-kernel branch"
+
+          validate_single_word "${COMMON_REPO_BRANCH}" \
+          "Custom Kernel repo branch"
+
+          if [ ! -z "${AK3_GIT_BRANCH}" ]; 
+            then 
+              validate_single_word "${AK3_GIT_BRANCH}" \
+              "AnyKernel3 fork branch"
+          fi
+
+          validate_single_word "${IMAGE_TYPE}" \
+          "Kernel image type"
+
+      - name: Setup build workspace and a local manifest
+        env:
+          USE_LATEST_CLANG: ${{ github.event.inputs.use_latest_clang }}
+          CUSTOM_MANIFEST: .repo/local_manifests/custom.xml
+        run: |
+          REPO_SOURCE=$(echo ${COMMON_REPO} | cut -d'/' -f3)
+          REPO_OWNER=$(echo ${COMMON_REPO} | cut -d'/' -f4)
+          REPO_NAME=$(echo ${COMMON_REPO} | cut -d'/' -f5)
+
+          mkdir kernel-build && cd $_
+          mkdir -p .repo/local_manifests
+
+          mecho() {
+            echo "$1" >> "${CUSTOM_MANIFEST}"
+          }
+
+          mecho '<?xml version="1.0" encoding="UTF-8"?>'
+          mecho '<manifest>'
+          mecho "  <remote name=\"common-repo\" fetch=\"https://${REPO_SOURCE}/${REPO_OWNER}\" />"
+          mecho ''
+          mecho '  <remove-project name="kernel/common" />'
+          mecho "  <project path=\"common\" name=\"${REPO_NAME}\" remote=\"common-repo\" revision=\"${COMMON_REPO_BRANCH}\" >"
+          mecho '    <linkfile src="." dest=".source_date_epoch_dir" />'
+          mecho '  </project>'
+
+          if [ "${USE_LATEST_CLANG}" = true ]; then
+            mecho '  <remove-project name="platform/prebuilts/clang/host/linux-x86" />'
+            mecho '  <project path="prebuilts/clang/host/linux-x86" name="platform/prebuilts/clang/host/linux-x86" revision="main" clone-depth="1" />'
+          fi
+
+          mecho '</manifest>'
+
+      - name: Download build utilities
+        working-directory: kernel-build
+        run: |
+          if [ -z "${AK3_GIT_BRANCH}" ]
+            then git clone --depth=1 ${AK3_GIT_URL} "${AK3_DIR}"
+            else git clone --depth=1 ${AK3_GIT_URL} "${AK3_DIR}" -b ${AK3_GIT_BRANCH}
+          fi
+
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+rx ~/.bin/repo
+          echo "${HOME}/.bin" >> ${GITHUB_PATH}
+
+      - name: Clean up container
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Initialize the manifest, and sync
+        working-directory: kernel-build
+        run: |
+          repo init \
+            --no-tags \
+            --depth=1 \
+            --dissociate \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b ${ACK_BRANCH}
+
+          repo sync \
+            --no-tags \
+            --clone-bundle \
+            --current-branch \
+            --optimized-fetch \
+            --force-sync \
+            --fetch-submodules \
+            -j$(nproc --all)
+
+      - name: Build, and process the kernel(s)
+        working-directory: kernel-build
+        env:
+          EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
+          FAST_BUILD: ${{ github.event.inputs.fast_build }}
+          USE_KLEAF: ${{ github.event.inputs.use_kleaf }}
+          OUT_DIR: ${{ github.workspace }}/kernel-build/out
+          OUT_BAZEL_DIR: ${{ github.workspace }}/kernel-build/bazel-bin/common
+        run: |
+          mkdir -p "${FINAL_DIR}"
+
+          for config in ${BUILD_CONFIGS}; do
+            echo "Building kernel config ${config+1}: ${config}"
+            
+            if [ "${USE_KLEAF}" = true ]; 
+              then
+                if [ "${FAST_BUILD}" = true ]; 
+                  then tools/bazel build ${EXTRA_ARGS} --config=fast //common:${config}
+                  else tools/bazel build ${EXTRA_ARGS} //common:${config}
+                fi
+
+                if [ -f "${OUT_BAZEL_DIR}/${config}/${IMAGE_TYPE}" ]; 
+                  then
+                    sudo chmod 777 -R ${OUT_BAZEL_DIR}/${config}
+                    mv "${OUT_BAZEL_DIR}/${config}/${IMAGE_TYPE}" "${FINAL_DIR}/${IMAGE_TYPE}-${config}"
+                  else
+                    echo "Error: Output image not found for ${config}"
+                    exit 1
+                fi
+              else
+                BUILD_CONFIG=common/${config} ${EXTRA_ARGS} build/build.sh
+
+                if [ -f "${OUT_DIR}/dist/${IMAGE_TYPE}" ]; 
+                  then 
+                    mv "${OUT_DIR}/dist/${IMAGE_TYPE}" "${FINAL_DIR}/${IMAGE_TYPE}-${config}"
+                  else
+                    echo "Error: Output image not found for ${config}"
+                    exit 1
+                fi
+            fi
+          done
+
+      - name: Package Kernels with AnyKernel3
+        working-directory: kernel-build
+        run: |
+          for config in ${BUILD_CONFIGS}; do
+            if [ -f "${FINAL_DIR}/${IMAGE_TYPE}-${config}" ]; then
+              cp -r "${AK3_DIR}" "${AK3_DIR}-${config}"
+              cd "${AK3_DIR}-${config}"
+              
+              cp "${FINAL_DIR}/${IMAGE_TYPE}-${config}" "${AK3_DIR}-${config}/${IMAGE_TYPE}"
+              zip -r9 "${FINAL_DIR}/${config}.zip" * -x .git README.md *placeholder
+              
+              cd ..
+            fi
+          done
+
+      - name: Upload Kernel Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-packages
+          path: |
+            kernel-build/final_images/*.zip
+          if-no-files-found: error
+          retention-days: 30
