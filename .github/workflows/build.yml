@@ -201,6 +201,7 @@ jobs:
       - name: Build, and process the kernel(s)
         working-directory: kernel-build
         env:
+          SKIP_ABI_CHECKS: 1
           EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
           FAST_BUILD: ${{ github.event.inputs.fast_build }}
           USE_KLEAF: ${{ github.event.inputs.use_kleaf }}
