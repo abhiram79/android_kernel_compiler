@@ -241,6 +241,7 @@ jobs:
           done
 
       - name: Package Kernels with AnyKernel3
+        if: always()
         working-directory: kernel-build
         run: |
           for config in ${BUILD_CONFIGS}; do
@@ -256,6 +257,7 @@ jobs:
           done
 
       - name: Upload Kernel Packages
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kernel-packages
